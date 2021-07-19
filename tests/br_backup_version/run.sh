@@ -27,17 +27,19 @@ unset BR_LOG_TO_TERM
 function check_version() {
     folder=$1
     expected_br_version=$2
-    br_version=`run_br -s "local://$TEST_DIR/$folder" debug decode --field "BrVersion"`
+    # FIXME we had strange log here, ignore it temporary
+    # [INFO] [data_slow_query.go:144] ["Telemetry slow query stats initialized"] [currentSQBInfo={xxx}]
+    br_version=`run_br -s "local://$TEST_DIR/$folder" debug decode --field "BrVersion" | grep -v INFO | grep -v log`
     [[ $br_version =~ $expected_br_version ]]
-    cluster_version=`run_br -s "local://$TEST_DIR/$folder" debug decode --field "ClusterVersion"`
+    cluster_version=`run_br -s "local://$TEST_DIR/$folder" debug decode --field "ClusterVersion" | grep -v INFO | grep -v log`
     [[ $cluster_version =~ $expected_cluster_version ]]
-    cluster_id=`run_br -s "local://$TEST_DIR/$folder" debug decode --field "ClusterId" | sed -n -e '1p'`
+    cluster_id=`run_br -s "local://$TEST_DIR/$folder" debug decode --field "ClusterId" | grep -v INFO | grep -v log | sed -n -e '1p'`
     [[ $expected_cluster_id =~ $cluster_id ]]
 }
 
 # backup empty using BR
 echo "backup start..."
-run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/br_version_1" --ratelimit 5 --concurrency 4
+run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/br_version_1"
 if [ $? -ne 0 ]; then
     echo "TEST: [$TEST_NAME] failed on backup empty cluster version!"
     exit 1
@@ -64,7 +66,7 @@ run_sql "INSERT INTO $DB.usertable1 VALUES (\"a\", \"b\");"
 
 # backup tables using BR
 echo "backup start..."
-run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/br_version_3" --ratelimit 5 --concurrency 4
+run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/br_version_3"
 if [ $? -ne 0 ]; then
     echo "TEST: [$TEST_NAME] failed on backup empty cluster version!"
     exit 1

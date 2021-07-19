@@ -26,7 +26,9 @@ import (
 	"github.com/pingcap/tidb/table"
 	"go.uber.org/zap"
 
+	berrors "github.com/pingcap/br/pkg/errors"
 	"github.com/pingcap/br/pkg/lightning/backend/kv"
+	"github.com/pingcap/br/pkg/lightning/checkpoints"
 	"github.com/pingcap/br/pkg/lightning/common"
 	"github.com/pingcap/br/pkg/lightning/log"
 	"github.com/pingcap/br/pkg/lightning/metric"
@@ -94,6 +96,30 @@ type EngineFileSize struct {
 	IsImporting bool
 }
 
+// LocalWriterConfig defines the configuration to open a LocalWriter
+type LocalWriterConfig struct {
+	// is the chunk KV written to this LocalWriter sent in order
+	IsKVSorted bool
+}
+
+// EngineConfig defines configuration used for open engine
+type EngineConfig struct {
+	// TableInfo is the corresponding tidb table info
+	TableInfo *checkpoints.TidbTableInfo
+	// local backend specified configuration
+	Local *LocalEngineConfig
+}
+
+// LocalEngineConfig is the configuration used for local backend in OpenEngine.
+type LocalEngineConfig struct {
+	// compact small SSTs before ingest into pebble
+	Compact bool
+	// raw kvs size threshold to trigger compact
+	CompactThreshold int64
+	// compact routine concurrency
+	CompactConcurrency int
+}
+
 // CheckCtx contains all parameters used in CheckRequirements
 type CheckCtx struct {
 	DBMetas []*mydump.MDDatabaseMeta
@@ -119,10 +145,13 @@ type AbstractBackend interface {
 	// NewEncoder creates an encoder of a TiDB table.
 	NewEncoder(tbl table.Table, options *kv.SessionOptions) (kv.Encoder, error)
 
-	OpenEngine(ctx context.Context, engineUUID uuid.UUID) error
+	OpenEngine(ctx context.Context, config *EngineConfig, engineUUID uuid.UUID) error
 
-	CloseEngine(ctx context.Context, engineUUID uuid.UUID) error
+	CloseEngine(ctx context.Context, config *EngineConfig, engineUUID uuid.UUID) error
 
+	// ImportEngine imports engine data to the backend. If it returns ErrDuplicateDetected,
+	// it means there is duplicate detected. For this situation, all data in the engine must be imported.
+	// It's safe to reset or cleanup this engine.
 	ImportEngine(ctx context.Context, engineUUID uuid.UUID) error
 
 	CleanupEngine(ctx context.Context, engineUUID uuid.UUID) error
@@ -167,7 +196,7 @@ type AbstractBackend interface {
 	ResetEngine(ctx context.Context, engineUUID uuid.UUID) error
 
 	// LocalWriter obtains a thread-local EngineWriter for writing rows into the given engine.
-	LocalWriter(ctx context.Context, engineUUID uuid.UUID) (EngineWriter, error)
+	LocalWriter(ctx context.Context, cfg *LocalWriterConfig, engineUUID uuid.UUID) (EngineWriter, error)
 }
 
 // Backend is the delivery target for Lightning
@@ -187,7 +216,6 @@ type engine struct {
 type OpenedEngine struct {
 	engine
 	tableName string
-	ts        uint64
 }
 
 // // import_ the data written to the engine into the target.
@@ -206,7 +234,6 @@ type ClosedEngine struct {
 type LocalEngineWriter struct {
 	writer    EngineWriter
 	tableName string
-	ts        uint64
 }
 
 func MakeBackend(ab AbstractBackend) Backend {
@@ -286,18 +313,18 @@ func (be Backend) UnsafeImportAndReset(ctx context.Context, engineUUID uuid.UUID
 			uuid:    engineUUID,
 		},
 	}
-	if err := closedEngine.Import(ctx); err != nil {
+	if err := closedEngine.Import(ctx); err != nil && !berrors.Is(err, berrors.ErrDuplicateDetected) {
 		return err
 	}
 	return be.abstract.ResetEngine(ctx, engineUUID)
 }
 
 // OpenEngine opens an engine with the given table name and engine ID.
-func (be Backend) OpenEngine(ctx context.Context, tableName string, engineID int32, ts uint64) (*OpenedEngine, error) {
+func (be Backend) OpenEngine(ctx context.Context, config *EngineConfig, tableName string, engineID int32) (*OpenedEngine, error) {
 	tag, engineUUID := MakeUUID(tableName, engineID)
 	logger := makeLogger(tag, engineUUID)
 
-	if err := be.abstract.OpenEngine(ctx, engineUUID); err != nil {
+	if err := be.abstract.OpenEngine(ctx, config, engineUUID); err != nil {
 		return nil, err
 	}
 
@@ -322,13 +349,12 @@ func (be Backend) OpenEngine(ctx context.Context, tableName string, engineID int
 			uuid:    engineUUID,
 		},
 		tableName: tableName,
-		ts:        ts,
 	}, nil
 }
 
 // Close the opened engine to prepare it for importing.
-func (engine *OpenedEngine) Close(ctx context.Context) (*ClosedEngine, error) {
-	closedEngine, err := engine.unsafeClose(ctx)
+func (engine *OpenedEngine) Close(ctx context.Context, cfg *EngineConfig) (*ClosedEngine, error) {
+	closedEngine, err := engine.unsafeClose(ctx, cfg)
 	if err == nil {
 		metric.ImporterEngineCounter.WithLabelValues("closed").Inc()
 	}
@@ -340,21 +366,25 @@ func (engine *OpenedEngine) Flush(ctx context.Context) error {
 	return engine.backend.FlushEngine(ctx, engine.uuid)
 }
 
-func (engine *OpenedEngine) LocalWriter(ctx context.Context) (*LocalEngineWriter, error) {
-	w, err := engine.backend.LocalWriter(ctx, engine.uuid)
+func (engine *OpenedEngine) LocalWriter(ctx context.Context, cfg *LocalWriterConfig) (*LocalEngineWriter, error) {
+	w, err := engine.backend.LocalWriter(ctx, cfg, engine.uuid)
 	if err != nil {
 		return nil, err
 	}
-	return &LocalEngineWriter{writer: w, ts: engine.ts, tableName: engine.tableName}, nil
+	return &LocalEngineWriter{writer: w, tableName: engine.tableName}, nil
 }
 
 // WriteRows writes a collection of encoded rows into the engine.
 func (w *LocalEngineWriter) WriteRows(ctx context.Context, columnNames []string, rows kv.Rows) error {
-	return w.writer.AppendRows(ctx, w.tableName, columnNames, w.ts, rows)
+	return w.writer.AppendRows(ctx, w.tableName, columnNames, rows)
 }
 
-func (w *LocalEngineWriter) Close() error {
-	return w.writer.Close()
+func (w *LocalEngineWriter) Close(ctx context.Context) (ChunkFlushStatus, error) {
+	return w.writer.Close(ctx)
+}
+
+func (w *LocalEngineWriter) IsSynced() bool {
+	return w.writer.IsSynced()
 }
 
 // UnsafeCloseEngine closes the engine without first opening it.
@@ -362,9 +392,9 @@ func (w *LocalEngineWriter) Close() error {
 // (Open -> Write -> Close -> Import). This method should only be used when one
 // knows via other ways that the engine has already been opened, e.g. when
 // resuming from a checkpoint.
-func (be Backend) UnsafeCloseEngine(ctx context.Context, tableName string, engineID int32) (*ClosedEngine, error) {
+func (be Backend) UnsafeCloseEngine(ctx context.Context, cfg *EngineConfig, tableName string, engineID int32) (*ClosedEngine, error) {
 	tag, engineUUID := MakeUUID(tableName, engineID)
-	return be.UnsafeCloseEngineWithUUID(ctx, tag, engineUUID)
+	return be.UnsafeCloseEngineWithUUID(ctx, cfg, tag, engineUUID)
 }
 
 // UnsafeCloseEngineWithUUID closes the engine without first opening it.
@@ -372,17 +402,17 @@ func (be Backend) UnsafeCloseEngine(ctx context.Context, tableName string, engin
 // (Open -> Write -> Close -> Import). This method should only be used when one
 // knows via other ways that the engine has already been opened, e.g. when
 // resuming from a checkpoint.
-func (be Backend) UnsafeCloseEngineWithUUID(ctx context.Context, tag string, engineUUID uuid.UUID) (*ClosedEngine, error) {
+func (be Backend) UnsafeCloseEngineWithUUID(ctx context.Context, cfg *EngineConfig, tag string, engineUUID uuid.UUID) (*ClosedEngine, error) {
 	return engine{
 		backend: be.abstract,
 		logger:  makeLogger(tag, engineUUID),
 		uuid:    engineUUID,
-	}.unsafeClose(ctx)
+	}.unsafeClose(ctx, cfg)
 }
 
-func (en engine) unsafeClose(ctx context.Context) (*ClosedEngine, error) {
+func (en engine) unsafeClose(ctx context.Context, cfg *EngineConfig) (*ClosedEngine, error) {
 	task := en.logger.Begin(zap.InfoLevel, "engine close")
-	err := en.backend.CloseEngine(ctx, en.uuid)
+	err := en.backend.CloseEngine(ctx, cfg, en.uuid)
 	task.End(zap.ErrorLevel, err)
 	if err != nil {
 		return nil, err
@@ -397,6 +427,9 @@ func (engine *ClosedEngine) Import(ctx context.Context) error {
 	for i := 0; i < importMaxRetryTimes; i++ {
 		task := engine.logger.With(zap.Int("retryCnt", i)).Begin(zap.InfoLevel, "import")
 		err = engine.backend.ImportEngine(ctx, engine.uuid)
+		if berrors.Is(err, berrors.ErrDuplicateDetected) {
+			return err
+		}
 		if !common.IsRetryableError(err) {
 			task.End(zap.ErrorLevel, err)
 			return err
@@ -420,13 +453,17 @@ func (engine *ClosedEngine) Logger() log.Logger {
 	return engine.logger
 }
 
+type ChunkFlushStatus interface {
+	Flushed() bool
+}
+
 type EngineWriter interface {
 	AppendRows(
 		ctx context.Context,
 		tableName string,
 		columnNames []string,
-		commitTS uint64,
 		rows kv.Rows,
 	) error
-	Close() error
+	IsSynced() bool
+	Close(ctx context.Context) (ChunkFlushStatus, error)
 }

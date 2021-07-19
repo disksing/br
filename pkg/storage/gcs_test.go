@@ -4,7 +4,7 @@ package storage
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"os"
 
 	"github.com/fsouza/fake-gcs-server/fakestorage"
@@ -31,18 +31,24 @@ func (r *testStorageSuite) TestGCS(c *C) {
 		CredentialsBlob: "Fake Credentials",
 	}
 	stg, err := newGCSStorage(ctx, gcs, &ExternalStorageOptions{
-		SendCredentials: false,
-		SkipCheckPath:   false,
-		HTTPClient:      server.HTTPClient(),
+		SendCredentials:  false,
+		CheckPermissions: []Permission{AccessBuckets},
+		HTTPClient:       server.HTTPClient(),
 	})
 	c.Assert(err, IsNil)
 
 	err = stg.WriteFile(ctx, "key", []byte("data"))
 	c.Assert(err, IsNil)
 
+	err = stg.WriteFile(ctx, "key1", []byte("data1"))
+	c.Assert(err, IsNil)
+
+	err = stg.WriteFile(ctx, "key2", []byte("data22223346757222222222289722222"))
+	c.Assert(err, IsNil)
+
 	rc, err := server.Client().Bucket(bucketName).Object("a/b/key").NewReader(ctx)
 	c.Assert(err, IsNil)
-	d, err := ioutil.ReadAll(rc)
+	d, err := io.ReadAll(rc)
 	rc.Close()
 	c.Assert(err, IsNil)
 	c.Assert(d, DeepEquals, []byte("data"))
@@ -59,6 +65,67 @@ func (r *testStorageSuite) TestGCS(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(exist, IsFalse)
 
+	list := ""
+	var totalSize int64 = 0
+	err = stg.WalkDir(ctx, nil, func(name string, size int64) error {
+		list += name
+		totalSize += size
+		return nil
+	})
+	c.Assert(err, IsNil)
+	c.Assert(list, Equals, "keykey1key2")
+	c.Assert(totalSize, Equals, int64(42))
+
+	efr, err := stg.Open(ctx, "key2")
+	c.Assert(err, IsNil)
+
+	p := make([]byte, 10)
+	n, err := efr.Read(p)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, 10)
+	c.Assert(string(p), Equals, "data222233")
+
+	p = make([]byte, 40)
+	n, err = efr.Read(p)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, 23)
+	c.Assert(string(p[:23]), Equals, "46757222222222289722222")
+
+	p = make([]byte, 5)
+	offs, err := efr.Seek(3, io.SeekStart)
+	c.Assert(err, IsNil)
+	c.Assert(offs, Equals, int64(3))
+
+	n, err = efr.Read(p)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, 5)
+	c.Assert(string(p), Equals, "a2222")
+
+	p = make([]byte, 5)
+	offs, err = efr.Seek(3, io.SeekCurrent)
+	c.Assert(err, IsNil)
+	c.Assert(offs, Equals, int64(11))
+
+	n, err = efr.Read(p)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, 5)
+	c.Assert(string(p), Equals, "67572")
+
+	/* Since fake_gcs_server hasn't support for negative offset yet.
+	p = make([]byte, 5)
+	offs, err = efr.Seek(int64(-7), io.SeekEnd)
+	c.Assert(err, IsNil)
+	c.Assert(offs, Equals, int64(-7))
+
+	n, err = efr.Read(p)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, 5)
+	c.Assert(string(p), Equals, "97222")
+	*/
+
+	err = efr.Close()
+	c.Assert(err, IsNil)
+
 	c.Assert(stg.URI(), Equals, "gcs://testbucket/a/b/")
 }
 
@@ -72,6 +139,7 @@ func (r *testStorageSuite) TestNewGCSStorage(c *C) {
 	c.Assert(err1, IsNil)
 	bucketName := "testbucket"
 	server.CreateBucketWithOpts(fakestorage.CreateBucketOpts{Name: bucketName})
+	testDir := c.MkDir()
 
 	{
 		gcs := &backuppb.GCS{
@@ -82,9 +150,9 @@ func (r *testStorageSuite) TestNewGCSStorage(c *C) {
 			CredentialsBlob: "FakeCredentials",
 		}
 		_, err := newGCSStorage(ctx, gcs, &ExternalStorageOptions{
-			SendCredentials: true,
-			SkipCheckPath:   false,
-			HTTPClient:      server.HTTPClient(),
+			SendCredentials:  true,
+			CheckPermissions: []Permission{AccessBuckets},
+			HTTPClient:       server.HTTPClient(),
 		})
 		c.Assert(err, IsNil)
 		c.Assert(gcs.CredentialsBlob, Equals, "FakeCredentials")
@@ -99,16 +167,16 @@ func (r *testStorageSuite) TestNewGCSStorage(c *C) {
 			CredentialsBlob: "FakeCredentials",
 		}
 		_, err := newGCSStorage(ctx, gcs, &ExternalStorageOptions{
-			SendCredentials: false,
-			SkipCheckPath:   false,
-			HTTPClient:      server.HTTPClient(),
+			SendCredentials:  false,
+			CheckPermissions: []Permission{AccessBuckets},
+			HTTPClient:       server.HTTPClient(),
 		})
 		c.Assert(err, IsNil)
 		c.Assert(gcs.CredentialsBlob, Equals, "")
 	}
 
 	{
-		fakeCredentialsFile, err := ioutil.TempFile("", "fakeCredentialsFile")
+		fakeCredentialsFile, err := os.CreateTemp(testDir, "fakeCredentialsFile")
 		c.Assert(err, IsNil)
 		defer func() {
 			fakeCredentialsFile.Close()
@@ -128,16 +196,16 @@ func (r *testStorageSuite) TestNewGCSStorage(c *C) {
 			CredentialsBlob: "",
 		}
 		_, err = newGCSStorage(ctx, gcs, &ExternalStorageOptions{
-			SendCredentials: true,
-			SkipCheckPath:   false,
-			HTTPClient:      server.HTTPClient(),
+			SendCredentials:  true,
+			CheckPermissions: []Permission{AccessBuckets},
+			HTTPClient:       server.HTTPClient(),
 		})
 		c.Assert(err, IsNil)
 		c.Assert(gcs.CredentialsBlob, Equals, `{"type": "service_account"}`)
 	}
 
 	{
-		fakeCredentialsFile, err := ioutil.TempFile("", "fakeCredentialsFile")
+		fakeCredentialsFile, err := os.CreateTemp(testDir, "fakeCredentialsFile")
 		c.Assert(err, IsNil)
 		defer func() {
 			fakeCredentialsFile.Close()
@@ -157,9 +225,9 @@ func (r *testStorageSuite) TestNewGCSStorage(c *C) {
 			CredentialsBlob: "",
 		}
 		s, err := newGCSStorage(ctx, gcs, &ExternalStorageOptions{
-			SendCredentials: false,
-			SkipCheckPath:   false,
-			HTTPClient:      server.HTTPClient(),
+			SendCredentials:  false,
+			CheckPermissions: []Permission{AccessBuckets},
+			HTTPClient:       server.HTTPClient(),
 		})
 		c.Assert(err, IsNil)
 		c.Assert(gcs.CredentialsBlob, Equals, "")
@@ -176,9 +244,9 @@ func (r *testStorageSuite) TestNewGCSStorage(c *C) {
 			CredentialsBlob: "",
 		}
 		_, err := newGCSStorage(ctx, gcs, &ExternalStorageOptions{
-			SendCredentials: true,
-			SkipCheckPath:   false,
-			HTTPClient:      server.HTTPClient(),
+			SendCredentials:  true,
+			CheckPermissions: []Permission{AccessBuckets},
+			HTTPClient:       server.HTTPClient(),
 		})
 		c.Assert(err, NotNil)
 	}
@@ -192,9 +260,9 @@ func (r *testStorageSuite) TestNewGCSStorage(c *C) {
 			CredentialsBlob: "FakeCredentials",
 		}
 		s, err := newGCSStorage(ctx, gcs, &ExternalStorageOptions{
-			SendCredentials: false,
-			SkipCheckPath:   false,
-			HTTPClient:      server.HTTPClient(),
+			SendCredentials:  false,
+			CheckPermissions: []Permission{AccessBuckets},
+			HTTPClient:       server.HTTPClient(),
 		})
 		c.Assert(err, IsNil)
 		c.Assert(gcs.CredentialsBlob, Equals, "")

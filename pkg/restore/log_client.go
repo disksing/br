@@ -20,8 +20,8 @@ import (
 	filter "github.com/pingcap/tidb-tools/pkg/table-filter"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/store/tikv/oracle"
 	titable "github.com/pingcap/tidb/table"
+	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
@@ -192,7 +192,11 @@ func (l *LogClient) NeedRestoreDDL(fileName string) (bool, error) {
 	// maxUint64 - the first DDL event's commit ts as the file name to return the latest ddl file.
 	// see details at https://github.com/pingcap/ticdc/pull/826/files#diff-d2e98b3ed211b7b9bb7b6da63dd48758R81
 	ts = maxUint64 - ts
-	if l.maybeTSInRange(ts) {
+
+	// In cdc, we choose the first event as the file name of DDL file.
+	// so if the file ts is large than endTS, we can skip to execute it.
+	// FIXME find a unified logic to filter row changes files and ddl files.
+	if ts <= l.endTS {
 		return true, nil
 	}
 	log.Info("filter ddl file by ts", zap.String("name", fileName), zap.Uint64("ts", ts))
